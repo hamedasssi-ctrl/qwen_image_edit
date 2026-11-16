@@ -41,6 +41,15 @@ jobs:
           echo "$RUNNER_TEMP/crane-bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/crane-bin/crane" version
 
+      - name: Prepare parallel download and compression tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v aria2c >/dev/null || ! command -v pigz >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq aria2 pigz
+          fi
+
       - name: Sign in to GitHub Container Registry
         uses: docker/login-action@v4
         with:
@@ -60,6 +69,12 @@ jobs:
           source = pathlib.Path('Dockerfile').read_text()
           models = re.findall(r'RUN wget -q (\S+) -O (\S+)', source)
           assert len(models) == 4, 'Expected exactly four original model files'
+          expected = {
+              'qwen_image_edit_2511_fp8mixed.safetensors': 'c9fdc158e46d3b61ef75f21ae866ca2fe808bf4a53643120d1c1e87c19280a4e',
+              'Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors': '22226e8d05d354bb356627d428809f5afd7819399b077238a2b70a82883a904f',
+              'qwen_2.5_vl_7b_fp8_scaled.safetensors': 'cb5636d852a0ea6a9075ab1bef496c0db7aef13c02350571e388aea959c5c0b4',
+              'qwen_image_vae.safetensors': 'a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f',
+          }
           image = os.environ['IMAGE_NAME']
           base = os.environ['RUNTIME_REF']
           original = json.loads(run('crane', 'config', base))
@@ -78,7 +93,7 @@ jobs:
               target = payload / dest.lstrip('/')
               target.parent.mkdir(parents=True)
               print(f'Downloading model {index}/4: {dest}', flush=True)
-              subprocess.run(['curl', '--fail', '--location', '--silent', '--show-error', '--retry', '3', '--connect-timeout', '30', url, '-o', str(target)], check=True)
+              subprocess.run(['aria2c', '--no-conf=true', '--no-netrc=true', '--file-allocation=none', '--max-connection-per-server=8', '--split=8', '--min-split-size=16M', '--connect-timeout=30', '--timeout=60', '--max-tries=3', '--retry-wait=5', '--summary-interval=30', '--show-console-readout=false', '--console-log-level=notice', '--dir', str(target.parent), '--out', target.name, url], check=True, timeout=1800)
               size = target.stat().st_size
               with target.open('rb') as f:
                   header_size = struct.unpack('<Q', f.read(8))[0]
@@ -90,13 +105,14 @@ jobs:
               with target.open('rb') as f:
                   for block in iter(lambda: f.read(8 * 1024**2), b''):
                       digest.update(block)
+              assert digest.hexdigest() == expected[target.name], 'Model differs from the upstream published SHA256'
               target.chmod(0o644)
               records.append({'path': dest, 'url': url, 'bytes': size, 'sha256': digest.hexdigest()})
               print(f'Validated {size} bytes; SHA256 {digest.hexdigest()}', flush=True)
               layer = root / 'model.tar.gz'
               with layer.open('wb') as out:
                   tar = subprocess.Popen(['tar', '--owner=0', '--group=0', '--numeric-owner', '-C', str(payload), '-cf', '-', 'ComfyUI'], stdout=subprocess.PIPE)
-                  gzip = subprocess.run(['gzip', '-1'], stdin=tar.stdout, stdout=out)
+                  gzip = subprocess.run(['pigz', '-1', '-p', '4'], stdin=tar.stdout, stdout=out)
                   tar.stdout.close()
                   assert gzip.returncode == 0 and tar.wait() == 0, 'Layer packaging failed'
               tag = f"{image}:stage-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}-model{index}"
