@@ -57,18 +57,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Add and validate the four original model files
-        id: candidate
+      - name: Build bounded model layers and verify exact reassembly
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
           import hashlib, json, os, pathlib, re, shutil, struct, subprocess
+          
+          assembler_source = '"""Reassemble bundled model chunks, verify SHA256, then leave launch to the wrapper."""\nimport argparse\nimport hashlib\nimport json\nimport os\nfrom pathlib import Path\nimport shutil\nimport tempfile\n\n\ndef sha256(path):\n    digest = hashlib.sha256()\n    with path.open(\'rb\') as source:\n        for block in iter(lambda: source.read(8 * 1024**2), b\'\'):\n            digest.update(block)\n    return digest.hexdigest()\n\n\ndef assemble(models, root=Path(\'/\')):\n    for model in models:\n        destination = Path(model[\'path\'])\n        if not str(destination).startswith(\'/ComfyUI/models/\') or \'..\' in destination.parts:\n            raise ValueError(\'Invalid model destination\')\n        target = root / str(destination).lstrip(\'/\')\n        if target.exists():\n            if target.stat().st_size != model[\'bytes\'] or sha256(target) != model[\'sha256\']:\n                raise RuntimeError(f\'Existing model does not match: {destination}\')\n            print(f\'Model already verified: {destination}\', flush=True)\n            continue\n        parts = []\n        for item in model[\'parts\']:\n            relative = Path(item[\'path\'])\n            if relative.is_absolute() or \'..\' in relative.parts or relative.parts[0] != \'grandshop-model-parts\':\n                raise ValueError(\'Invalid chunk path\')\n            part = root / relative\n            if part.stat().st_size != item[\'bytes\']:\n                raise RuntimeError(f\'Incomplete model chunk: {relative}\')\n            parts.append(part)\n        if sum(p.stat().st_size for p in parts) != model[\'bytes\']:\n            raise RuntimeError(\'Model chunks have the wrong total size\')\n        target.parent.mkdir(parents=True, exist_ok=True)\n        if shutil.disk_usage(target.parent).free < model[\'bytes\'] + 1024**3:\n            raise RuntimeError(f\'Insufficient writable disk to assemble {destination}\')\n        temporary = None\n        try:\n            digest = hashlib.sha256()\n            with tempfile.NamedTemporaryFile(dir=target.parent, prefix=target.name + \'.assemble-\', delete=False) as output:\n                temporary = Path(output.name)\n                for part in parts:\n                    with part.open(\'rb\') as source:\n                        for block in iter(lambda: source.read(8 * 1024**2), b\'\'):\n                            output.write(block)\n                            digest.update(block)\n            if digest.hexdigest() != model[\'sha256\']:\n                raise RuntimeError(f\'Model checksum mismatch: {destination}\')\n            temporary.chmod(0o644)\n            os.replace(temporary, target)\n            print(f\'Assembled and verified: {destination}\', flush=True)\n        finally:\n            if temporary is not None and temporary.exists():\n                temporary.unlink()\n\n\nif __name__ == \'__main__\':\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument(\'--manifest\', default=\'/grandshop-model-parts.json\')\n    parser.add_argument(\'--root\', default=\'/\')\n    args = parser.parse_args()\n    assemble(json.loads(Path(args.manifest).read_text()), Path(args.root))\n'
+          
+          scope = {'__name__': 'grandshop_model_assembly'}
+          exec(compile(assembler_source, 'assemble_models.py', 'exec'), scope)
           def run(*args):
               return subprocess.check_output(args, text=True).strip()
           source = pathlib.Path('Dockerfile').read_text()
           models = re.findall(r'RUN wget -q (\S+) -O (\S+)', source)
-          assert len(models) == 4, 'Expected exactly four original model files'
+          assert len(models) == 4
           expected = {
               'qwen_image_edit_2511_fp8mixed.safetensors': 'c9fdc158e46d3b61ef75f21ae866ca2fe808bf4a53643120d1c1e87c19280a4e',
               'Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors': '22226e8d05d354bb356627d428809f5afd7819399b077238a2b70a82883a904f',
@@ -79,66 +83,113 @@ jobs:
           base = os.environ['RUNTIME_REF']
           original = json.loads(run('crane', 'config', base))
           assert original['architecture'] == 'amd64' and original['os'] == 'linux'
-          assert 'entrypoint.sh' in ' '.join(original['config'].get('Cmd', []))
+          assert original['config']['Cmd'] == ['/entrypoint.sh']
           original_layers = json.loads(run('crane', 'manifest', base))['layers']
-          records = []
+          records, assembly = [], []
           root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'grandshop-model-layer'
           root.mkdir()
+          payload = root / 'payload'
+          added = 0
+          
+          def publish(paths, label, final=False):
+              global base, added
+              layer = root / 'model.tar.gz'
+              print(f'Packaging {label}', flush=True)
+              with layer.open('wb') as out:
+                  tar = subprocess.Popen(['tar', '--owner=0', '--group=0', '--numeric-owner', '-C', str(payload), '-cf', '-', *paths], stdout=subprocess.PIPE)
+                  gzip = subprocess.run(['pigz', '-1', '-p', '4'], stdin=tar.stdout, stdout=out)
+                  tar.stdout.close()
+                  assert gzip.returncode == 0 and tar.wait() == 0
+              assert layer.stat().st_size < 9_500_000_000, 'Layer exceeds the GHCR safety limit'
+              tag = f"{image}:stage-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}-{label}"
+              if final:
+                  tag = f"{image}:candidate-{os.environ['SOURCE_SHA'][:7]}-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
+              print(f'Publishing {label}: {layer.stat().st_size} bytes', flush=True)
+              subprocess.run(['crane', 'append', '--base', base, '--new_layer', str(layer), '--new_tag', tag], check=True)
+              base = f"{image}@{run('crane', 'digest', tag)}"
+              added += 1
+              print(f'Saved {label}: {base}', flush=True)
+              layer.unlink()
+              return tag
+          
           for index, (url, dest) in enumerate(models, 1):
               assert url.startswith('https://huggingface.co/')
               assert dest.startswith('/ComfyUI/models/') and '..' not in dest
-              assert dest.endswith('.safetensors')
-              assert shutil.disk_usage(root).free > 45 * 1024**3, 'Insufficient free disk space'
-              payload = root / 'payload'
+              assert shutil.disk_usage(root).free > 50 * 1024**3
               target = payload / dest.lstrip('/')
               target.parent.mkdir(parents=True)
               print(f'Downloading model {index}/4: {dest}', flush=True)
-              subprocess.run(['aria2c', '--no-conf=true', '--no-netrc=true', '--file-allocation=none', '--max-connection-per-server=8', '--split=8', '--min-split-size=16M', '--connect-timeout=30', '--timeout=60', '--max-tries=3', '--retry-wait=5', '--summary-interval=30', '--show-console-readout=false', '--console-log-level=notice', '--dir', str(target.parent), '--out', target.name, url], check=True, timeout=1800)
+              subprocess.run(['aria2c', '--no-conf=true', '--no-netrc=true', '--file-allocation=none', '--max-connection-per-server=8', '--split=8', '--min-split-size=16M', '--connect-timeout=30', '--timeout=60', '--max-tries=3', '--retry-wait=5', '--summary-interval=30', '--show-console-readout=false', '--console-log-level=warn', '--dir', str(target.parent), '--out', target.name, url], check=True, timeout=1800)
               size = target.stat().st_size
               with target.open('rb') as f:
                   header_size = struct.unpack('<Q', f.read(8))[0]
-                  assert 0 < header_size < 100_000_000, 'Invalid safetensors header'
+                  assert 0 < header_size < 100_000_000
                   header = json.loads(f.read(header_size))
               tensors = [v for k, v in header.items() if k != '__metadata__']
-              assert tensors and max(t['data_offsets'][1] for t in tensors) == size - 8 - header_size, 'Incomplete model download'
-              digest = hashlib.sha256()
-              with target.open('rb') as f:
-                  for block in iter(lambda: f.read(8 * 1024**2), b''):
-                      digest.update(block)
-              assert digest.hexdigest() == expected[target.name], 'Model differs from the upstream published SHA256'
+              assert tensors and max(t['data_offsets'][1] for t in tensors) == size - 8 - header_size
+              checksum = scope['sha256'](target)
+              assert checksum == expected[target.name], 'Model differs from upstream SHA256'
+              print(f'Validated model {index}/4: {size} bytes; SHA256 {checksum}', flush=True)
+              record = {'path': dest, 'url': url, 'bytes': size, 'sha256': checksum}
+              records.append(record)
               target.chmod(0o644)
-              records.append({'path': dest, 'url': url, 'bytes': size, 'sha256': digest.hexdigest()})
-              print(f'Validated {size} bytes; SHA256 {digest.hexdigest()}', flush=True)
-              layer = root / 'model.tar.gz'
-              with layer.open('wb') as out:
-                  tar = subprocess.Popen(['tar', '--owner=0', '--group=0', '--numeric-owner', '-C', str(payload), '-cf', '-', 'ComfyUI'], stdout=subprocess.PIPE)
-                  gzip = subprocess.run(['pigz', '-1', '-p', '4'], stdin=tar.stdout, stdout=out)
-                  tar.stdout.close()
-                  assert gzip.returncode == 0 and tar.wait() == 0, 'Layer packaging failed'
-              tag = f"{image}:stage-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}-model{index}"
-              if index == 4:
-                  tag = f"{image}:candidate-{os.environ['SOURCE_SHA'][:7]}-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
-              print(f'Publishing model {index}/4 without downloading parent layers', flush=True)
-              subprocess.run(['crane', 'append', '--base', base, '--new_layer', str(layer), '--new_tag', tag], check=True)
-              base = f"{image}@{run('crane', 'digest', tag)}"
-              print(f'Saved model {index}/4: {base}', flush=True)
+              if size > 7_000_000_000:
+                  parts = []
+                  with target.open('rb') as source:
+                      remaining = size
+                      while remaining:
+                          relative = f'grandshop-model-parts/model{index}/part{len(parts):03d}'
+                          part = payload / relative
+                          part.parent.mkdir(parents=True, exist_ok=True)
+                          count = min(7_000_000_000, remaining)
+                          left = count
+                          with part.open('wb') as out:
+                              while left:
+                                  block = source.read(min(8 * 1024**2, left))
+                                  assert block
+                                  out.write(block)
+                                  left -= len(block)
+                          part.chmod(0o644)
+                          parts.append({'path': relative, 'bytes': count})
+                          remaining -= count
+                  target.unlink()
+                  assembled = dict(record, parts=parts)
+                  print(f'Testing exact reassembly of model {index}/4', flush=True)
+                  scope['assemble']([assembled], payload)
+                  assert target.stat().st_size == size
+                  target.unlink()
+                  assembly.append(assembled)
+                  for part_index, part in enumerate(parts):
+                      publish([part['path']], f'model{index}-part{part_index}')
+                      (payload / part['path']).unlink()
+              else:
+                  publish([dest.lstrip('/')], f'model{index}')
               shutil.rmtree(payload)
-              layer.unlink()
+          
+          payload.mkdir()
+          (payload / 'grandshop-model-parts.json').write_text(json.dumps(assembly, indent=2) + '\n')
+          (payload / 'grandshop_assemble_models.py').write_text(assembler_source)
+          shutil.copyfile('entrypoint.sh', payload / 'grandshop-original-entrypoint.sh')
+          (payload / 'grandshop-original-entrypoint.sh').chmod(0o755)
+          (payload / 'entrypoint.sh').write_text('#!/bin/bash\nset -euo pipefail\npython3 /grandshop_assemble_models.py\nexec /grandshop-original-entrypoint.sh\n')
+          (payload / 'entrypoint.sh').chmod(0o755)
+          subprocess.run(['python3', '-m', 'py_compile', str(payload / 'grandshop_assemble_models.py')], check=True)
+          subprocess.run(['bash', '-n', str(payload / 'entrypoint.sh')], check=True)
+          tag = publish(['grandshop-model-parts.json', 'grandshop_assemble_models.py', 'grandshop-original-entrypoint.sh', 'entrypoint.sh'], 'startup-assembly', final=True)
           final = json.loads(run('crane', 'config', base))
-          assert final['config'] == original['config'], 'Runtime configuration changed'
+          assert final['config'] == original['config']
           manifest = json.loads(run('crane', 'manifest', base))
           assert manifest['layers'][:len(original_layers)] == original_layers
-          assert len(manifest['layers']) == len(original_layers) + 4
-          report = {'tag': tag, 'ref': base, 'source': os.environ['SOURCE_SHA'], 'runtime': os.environ['RUNTIME_REF'], 'models': records, 'gpu_test': 'NOT_RUN', 'runpod_changed': False}
-          pathlib.Path('candidate-build-report.json').write_text(json.dumps(report, indent=2) + '\n')
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
-              out.write(f'tag={tag}\nref={base}\n')
+          assert len(manifest['layers']) == len(original_layers) + added
+          assert all(layer['size'] < 10_000_000_000 for layer in manifest['layers'][len(original_layers):])
+          report = {'tag': tag, 'ref': base, 'source': os.environ['SOURCE_SHA'], 'runtime': os.environ['RUNTIME_REF'], 'models': records, 'new_layers': added, 'startup_reassembly_bytes': sum(m['bytes'] for m in assembly), 'reassembly_test': 'PASSED_FOR_EVERY_SPLIT_MODEL', 'gpu_test': 'NOT_RUN', 'runpod_changed': False}
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
               out.write('### Grand Shop candidate built; GPU quality test still required\n\n')
               out.write(f'- Image: `{tag}`\n- Immutable image: `{base}`\n')
-              out.write(f"- Source: `{os.environ['SOURCE_SHA']}`\n")
-              out.write('- Four model files validated; runtime configuration preserved.\n')
-              out.write('- Existing RunPod endpoint and Release 1 were not changed. No GPU job submitted.\n\n')
+              out.write('- All four upstream model checksums verified. All chunks round-trip tested before publication.\n')
+              out.write('- Models larger than 7 GB are bundled in chunks; startup verifies and assembles them before the original entrypoint.\n')
+              out.write(f"- Additional writable storage needed for assembled models: {report['startup_reassembly_bytes']} bytes, plus working space.\n")
+              out.write('- Existing RunPod endpoint and Release 1 unchanged. No GPU job submitted.\n\n')
               out.write('```json\n' + json.dumps(report, indent=2) + '\n```\n')
           print(f'Candidate image: {tag}\nImmutable image: {base}', flush=True)
           PY
