@@ -11,6 +11,8 @@ import urllib.parse
 import binascii # Base64 에러 처리를 위해 import
 import subprocess
 import time
+import io
+from PIL import Image, ImageStat
 
 
 # 로깅 설정
@@ -175,28 +177,45 @@ def process_input(input_data, temp_dir, output_filename, input_type):
         raise Exception(f"지원하지 않는 입력 타입: {input_type}")
 
 def download_file_from_url(url, output_path):
-    """URL에서 파일을 다운로드하는 함수"""
+    """Download a reference image; reject empty or non-image responses."""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.scheme not in ("https", "http") or not parsed.netloc:
+        raise ValueError("image_url must be a valid HTTP(S) URL")
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(request, timeout=45) as response:
+        content = response.read(30 * 1024 * 1024 + 1)
+    if not content or len(content) > 30 * 1024 * 1024:
+        raise ValueError("Reference image is empty or exceeds 30 MB")
+    with open(output_path, "wb") as file:
+        file.write(content)
+    logger.info("Reference downloaded (%d bytes)", len(content))
+    return output_path
+
+
+def inspect_image(data, label):
+    """Validate decodability and report image statistics without logging contents."""
     try:
-        result = subprocess.run([
-            'wget', '-O', output_path, '--no-verbose', url
-        ], capture_output=True, text=True)
-        if result.returncode == 0:
-            logger.info(f"✅ URL에서 파일을 성공적으로 다운로드했습니다: {url} -> {output_path}")
-            return output_path
-        else:
-            logger.error(f"❌ wget 다운로드 실패: {result.stderr}")
-            raise Exception(f"URL 다운로드 실패: {result.stderr}")
-    except subprocess.TimeoutExpired:
-        logger.error("❌ 다운로드 시간 초과")
-        raise Exception("다운로드 시간 초과")
-    except Exception as e:
-        logger.error(f"❌ 다운로드 중 오류 발생: {e}")
-        raise Exception(f"다운로드 중 오류 발생: {e}")
+        with Image.open(io.BytesIO(data)) as image:
+            image.load()
+            rgb = image.convert("RGB")
+            stat = ImageStat.Stat(rgb)
+            means = [round(v, 1) for v in stat.mean]
+            extrema = rgb.getextrema()
+            logger.info("%s: format=%s size=%s RGB means=%s extrema=%s",
+                        label, image.format, image.size, means, extrema)
+            if max(high for low, high in extrema) <= 8:
+                logger.warning("%s appears nearly black", label)
+                return "black"
+    except Exception as exc:
+        raise ValueError(f"{label} is not a valid readable image: {exc}") from exc
+    return "ok"
+
 
 def save_base64_to_file(base64_data, temp_dir, output_filename):
     """Base64 데이터를 파일로 저장하는 함수"""
     try:
-        decoded_data = base64.b64decode(base64_data)
+        decoded_data = base64.b64decode(base64_data, validate=True)
         os.makedirs(temp_dir, exist_ok=True)
         file_path = os.path.abspath(os.path.join(temp_dir, output_filename))
         with open(file_path, 'wb') as f:
@@ -210,7 +229,7 @@ def save_base64_to_file(base64_data, temp_dir, output_filename):
 def handler(job):
     job_input = job.get("input", {})
 
-    logger.info(f"Received job input: {job_input}")
+    logger.info("Received job with input keys: %s", sorted(job_input.keys()))
     task_id = f"task_{uuid.uuid4()}"
 
     # ------------------------------
@@ -234,6 +253,10 @@ def handler(job):
             image_paths.append(process_input(job_input[b64_key], task_id, fname, "base64"))
         else:
             break
+
+    for index, path in enumerate(image_paths, start=1):
+        with open(path, "rb") as source:
+            inspect_image(source.read(), f"input_{index}")
 
     num_images = len(image_paths)
     if num_images == 0:
@@ -259,6 +282,9 @@ def handler(job):
     prompt[_NODE_PROMPT]["inputs"]["prompt"] = job_input.get("prompt", "")
     if _NODE_SEED in prompt and "seed" in job_input:
         prompt[_NODE_SEED]["inputs"]["seed"] = job_input["seed"]
+    if ("width" in job_input or "height" in job_input):
+        logger.warning("Exact width/height are not supported by the supplied workflow; "
+                       "the workflow uses ImageScaleToTotalPixels node 93 (megapixels).")
     if _NODE_WIDTH in prompt and "width" in job_input:
         prompt[_NODE_WIDTH]["inputs"]["value"] = job_input["width"]
     if _NODE_HEIGHT in prompt and "height" in job_input:
@@ -298,8 +324,10 @@ def handler(job):
             if attempt == max_attempts - 1:
                 raise Exception("웹소켓 연결 시간 초과 (3분)")
             time.sleep(5)
-    images = get_images(ws, prompt)
-    ws.close()
+    try:
+        images = get_images(ws, prompt)
+    finally:
+        ws.close()
 
     # 이미지가 없는 경우 처리
     if not images:
@@ -308,7 +336,12 @@ def handler(job):
     # 첫 번째 이미지 반환
     for node_id in images:
         if images[node_id]:
-            return {"image": images[node_id][0]}
+            encoded = images[node_id][0]
+            raw = base64.b64decode(encoded, validate=True)
+            result = inspect_image(raw, "generated_output")
+            if result == "black":
+                return {"error": "Generated image is nearly black; inspect model/VAEDecode/workflow logs", "diagnostic": "BLACK_OUTPUT"}
+            return {"image": encoded}
     
     return {"error": "이미지를 찾을 수 없습니다."}
 
