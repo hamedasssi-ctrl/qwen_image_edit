@@ -1,7 +1,6 @@
 name: Grand Shop - build candidate only
 
-# DRAFT: committing this file to fix-black-image starts a build and GHCR push.
-# No RunPod API calls, GPU jobs, endpoint updates, or main-branch changes.
+# Publishes a separate GHCR image. No RunPod deployment or GPU requests.
 on:
   push:
     branches: [fix-black-image]
@@ -18,66 +17,71 @@ concurrency:
 jobs:
   build:
     if: github.repository == 'hamedasssi-ctrl/qwen_image_edit'
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
     env:
       SOURCE_SHA: 0d9f53944e38cf451cc0f175b27d09ccf9d31042
-      BASE_IMAGE: registry.runpod.net/wlsdml1114-qwen-image-edit-main-dockerfile:d1ae8b705
+      PUBLIC_BASE: wlsdml1114/multitalk-base@sha256:24d3f04f891ea8c3b783699b1e24801cb839e8c4c8b074a11f04e9eadf1110ff
       IMAGE_NAME: ghcr.io/hamedasssi-ctrl/qwen-image-edit
     steps:
-      - name: Checkout the reviewed handler revision
-        uses: actions/checkout@v4
+      - name: Checkout reviewed source
+        uses: actions/checkout@v6
         with:
           ref: 0d9f53944e38cf451cc0f175b27d09ccf9d31042
           persist-credentials: false
 
-      - name: Validate source and prepare isolated build context
+      - name: Free space on the disposable GitHub runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /usr/local/share/chromium
+          sudo apt-get clean
+          docker system prune --all --force
+          df -h /
+          available="$(df --output=avail -BG / | tail -1 | tr -dc '0-9')"
+          if [ "$available" -lt 45 ]; then
+            echo "::error::This standard runner has insufficient disk space; no paid runner will be used automatically."
+            exit 1
+          fi
+
+      - name: Validate and prepare staged source build
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           python3 -m py_compile handler.py
           python3 - <<'PY'
-          import json
+          import json, os, re, shutil
           from pathlib import Path
           w = json.loads(Path("workflow/qwen_image_edit_1_1image.json").read_text())
-          assert w["78"]["class_type"] == "LoadImage"
-          assert w["111"]["class_type"] == "TextEncodeQwenImageEditPlus"
-          assert w["60"]["class_type"] == "SaveImage"
-          assert w["3"]["inputs"]["steps"] == 4
-          assert w["3"]["inputs"]["cfg"] == 1
-          assert w["93"]["inputs"]["megapixels"] == 1
           assert sum(n["class_type"] == "LoadImage" for n in w.values()) == 1
-          source = Path("handler.py").read_text()
-          assert "BLACK_OUTPUT" in source and "validate=True" in source
-          print("Source compiles; single-image workflow matches the reviewed configuration.")
+          assert w["3"]["inputs"]["steps"] == 4 and w["3"]["inputs"]["cfg"] == 1
+          assert w["93"]["inputs"]["megapixels"] == 1
+          assert "BLACK_OUTPUT" in Path("handler.py").read_text()
+          original = Path("Dockerfile").read_text()
+          models = re.findall(r"^RUN wget -q (https://\S+) -O (\S+)\s*$", original, re.M)
+          assert len(models) == 4, "Expected exactly the four original model assets"
+          runtime = re.sub(r"^RUN wget -q .*\n?", "", original, flags=re.M)
+          runtime = re.sub(r"^FROM .*", "FROM " + os.environ["PUBLIC_BASE"], runtime, count=1, flags=re.M)
+          runtime = runtime.replace("git clone https://", "git clone --depth 1 https://")
+          runtime = runtime.replace("RUN pip install", "RUN pip install --no-cache-dir")
+          runtime = runtime.replace("COPY . .", "COPY --link handler.py /handler.py\nCOPY --link workflow/ /workflow/\nCOPY --link --chmod=0755 entrypoint.sh /entrypoint.sh")
+          runtime = runtime.replace("RUN chmod +x /entrypoint.sh", "RUN python -m py_compile /handler.py && python -c 'import runpod, websocket, PIL, torch; print(torch.__version__)' && pip freeze > /grandshop-build-dependencies.txt && git -C /ComfyUI rev-parse HEAD")
+          root = Path("runtime-context")
+          root.mkdir()
+          shutil.copy2("handler.py", root / "handler.py")
+          shutil.copy2("entrypoint.sh", root / "entrypoint.sh")
+          shutil.copytree("workflow", root / "workflow")
+          (root / "Dockerfile").write_text("# syntax=docker/dockerfile:1\n" + runtime)
+          Path("models.json").write_text(json.dumps(models))
+          print("Validated handler, single-image graph, and four original model URLs.")
           PY
-          mkdir -p candidate-context
-          cp handler.py candidate-context/handler.py
-          sha256sum candidate-context/handler.py
-          cat > candidate-context/Dockerfile <<'DOCKER'
-          # syntax=docker/dockerfile:1
-          ARG BASE_IMAGE
-          FROM ${BASE_IMAGE}
-          COPY --link --chmod=0644 handler.py /handler.py
-          WORKDIR /
-          CMD ["/entrypoint.sh"]
-          DOCKER
+          sha256sum runtime-context/handler.py
+          cat runtime-context/Dockerfile
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4
-
-      - name: Resolve and pin the current base image digest
-        id: base
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker buildx imagetools inspect "$BASE_IMAGE" > base-manifest.txt
-          cat base-manifest.txt
-          digest="$(awk '$1 == "Digest:" {print $2; exit}' base-manifest.txt)"
-          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
-          echo "ref=${BASE_IMAGE}@$digest" >> "$GITHUB_OUTPUT"
-          echo "tag=${IMAGE_NAME}:candidate-0d9f539-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
 
       - name: Sign in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -86,39 +90,67 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and store a separate candidate image
-        id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: ./candidate-context
-          file: ./candidate-context/Dockerfile
-          platforms: linux/amd64
-          push: true
-          pull: true
-          provenance: false
-          sbom: false
-          build-args: |
-            BASE_IMAGE=${{ steps.base.outputs.ref }}
-          tags: ${{ steps.base.outputs.tag }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/hamedasssi-ctrl/qwen_image_edit
-            org.opencontainers.image.revision=0d9f53944e38cf451cc0f175b27d09ccf9d31042
-            org.opencontainers.image.title=Grand Shop Qwen diagnostic candidate
+      - name: Build runtime from the pinned public base
+        id: runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${IMAGE_NAME}:stage-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-runtime"
+          docker buildx build --platform linux/amd64 --push --provenance=false --sbom=false --progress=plain --metadata-file runtime-metadata.json --tag "$tag" --label "org.opencontainers.image.source=https://github.com/hamedasssi-ctrl/qwen_image_edit" --label "org.opencontainers.image.revision=$SOURCE_SHA" runtime-context
+          digest="$(python3 -c 'import json; print(json.load(open("runtime-metadata.json"))["containerimage.digest"])')"
+          echo "${IMAGE_NAME}@$digest" > current-base.txt
+          echo "ref=${IMAGE_NAME}@$digest" >> "$GITHUB_OUTPUT"
+          docker buildx prune --all --force
+          df -h /
 
-      - name: Record the candidate and approval boundary
+      - name: Add original model weights one layer at a time
+        id: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          from pathlib import Path
+          models = json.loads(Path("models.json").read_text())
+          image = os.environ["IMAGE_NAME"]
+          run = os.environ["GITHUB_RUN_ID"]
+          attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+          base = Path("current-base.txt").read_text().strip()
+          context = Path("asset-context")
+          context.mkdir(exist_ok=True)
+          for number, (url, destination) in enumerate(models, start=1):
+              final = number == len(models)
+              tag = f"{image}:candidate-0d9f539-{run}-{attempt}" if final else f"{image}:stage-{run}-{attempt}-model{number}"
+              dockerfile = f"# syntax=docker/dockerfile:1\nFROM {base}\nADD --link --chmod=0644 {url} {destination}\n"
+              (context / "Dockerfile").write_text(dockerfile)
+              metadata = f"model-{number}-metadata.json"
+              print(f"Adding model {number}/{len(models)}: {destination}", flush=True)
+              subprocess.run(["docker", "buildx", "build", "--platform", "linux/amd64", "--push", "--provenance=false", "--sbom=false", "--progress=plain", "--metadata-file", metadata, "--tag", tag, str(context)], check=True)
+              digest = json.loads(Path(metadata).read_text())["containerimage.digest"]
+              assert re.fullmatch(r"sha256:[a-f0-9]{64}", digest)
+              base = f"{image}@{digest}"
+              Path("current-base.txt").write_text(base)
+              subprocess.run(["docker", "buildx", "prune", "--all", "--force"], check=True)
+              subprocess.run(["df", "-h", "/"], check=True)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"tag={tag}\nref={base}\n")
+          print(f"Candidate image: {tag}\nImmutable image: {base}", flush=True)
+          PY
+
+      - name: Record candidate and approval boundary
         env:
-          CANDIDATE_TAG: ${{ steps.base.outputs.tag }}
-          CANDIDATE_DIGEST: ${{ steps.build.outputs.digest }}
-          PINNED_BASE: ${{ steps.base.outputs.ref }}
+          CANDIDATE_TAG: ${{ steps.candidate.outputs.tag }}
+          CANDIDATE_REF: ${{ steps.candidate.outputs.ref }}
         shell: bash
         run: |
           {
-            echo "### Candidate built; GPU quality test still required"
+            echo "### Candidate built from source; GPU quality test still required"
             echo "- Image: $CANDIDATE_TAG"
-            echo "- Immutable image: ${IMAGE_NAME}@$CANDIDATE_DIGEST"
-            echo "- Base: $PINNED_BASE"
+            echo "- Immutable image: $CANDIDATE_REF"
             echo "- Source: $SOURCE_SHA"
+            echo "- Public base: $PUBLIC_BASE"
+            echo "- Model files: the four URLs from the reviewed Dockerfile"
+            echo "- Runtime dependencies were rebuilt from the source Dockerfile."
             echo "- Existing RunPod endpoint and Release 1 were not changed."
             echo "- No GPU test was submitted."
-            echo "- Do not deploy or change package visibility without approval."
           } >> "$GITHUB_STEP_SUMMARY"
