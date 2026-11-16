@@ -1,6 +1,6 @@
 name: Grand Shop - build candidate only
 
-# Publishes a separate GHCR image. No RunPod deployment or GPU requests.
+# Reuses the runtime built in run 43949736361; never deploys or calls RunPod.
 on:
   push:
     branches: [fix-black-image]
@@ -21,7 +21,7 @@ jobs:
     timeout-minutes: 90
     env:
       SOURCE_SHA: 0d9f53944e38cf451cc0f175b27d09ccf9d31042
-      PUBLIC_BASE: wlsdml1114/multitalk-base@sha256:24d3f04f891ea8c3b783699b1e24801cb839e8c4c8b074a11f04e9eadf1110ff
+      RUNTIME_REF: ghcr.io/hamedasssi-ctrl/qwen-image-edit@sha256:66ca813816da30d8f9a448af895a46b97af1314810a87c8bde87fee3787cd0b7
       IMAGE_NAME: ghcr.io/hamedasssi-ctrl/qwen-image-edit
     steps:
       - name: Checkout reviewed source
@@ -30,54 +30,16 @@ jobs:
           ref: 0d9f53944e38cf451cc0f175b27d09ccf9d31042
           persist-credentials: false
 
-      - name: Check available space on the standard runner
+      - name: Install pinned crane from the official release
         shell: bash
         run: |
           set -euo pipefail
-          df -h /
-          available="$(df --output=avail -BG / | tail -1 | tr -dc '0-9')"
-          if [ "$available" -lt 45 ]; then
-            echo "::error::This standard runner has insufficient disk space; no paid runner will be used automatically."
-            exit 1
-          fi
-
-      - name: Validate and prepare staged source build
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          python3 -m py_compile handler.py
-          python3 - <<'PY'
-          import json, os, re, shutil
-          from pathlib import Path
-          w = json.loads(Path("workflow/qwen_image_edit_1_1image.json").read_text())
-          assert sum(n["class_type"] == "LoadImage" for n in w.values()) == 1
-          assert w["3"]["inputs"]["steps"] == 4 and w["3"]["inputs"]["cfg"] == 1
-          assert w["93"]["inputs"]["megapixels"] == 1
-          assert "BLACK_OUTPUT" in Path("handler.py").read_text()
-          original = Path("Dockerfile").read_text()
-          models = re.findall(r"^RUN wget -q (https://\S+) -O (\S+)\s*$", original, re.M)
-          assert len(models) == 4, "Expected exactly the four original model assets"
-          runtime = re.sub(r"^RUN wget -q .*\n?", "", original, flags=re.M)
-          runtime = re.sub(r"^FROM .*", "FROM " + os.environ["PUBLIC_BASE"], runtime, count=1, flags=re.M)
-          runtime = runtime.replace("git clone https://", "git clone --depth 1 https://")
-          runtime = runtime.replace("RUN pip install", "RUN pip install --no-cache-dir")
-          runtime = runtime.replace("COPY . .", "COPY --link handler.py /handler.py\nCOPY --link workflow/ /workflow/\nCOPY --link --chmod=0755 entrypoint.sh /entrypoint.sh")
-          runtime = runtime.replace("RUN chmod +x /entrypoint.sh", "RUN python -m py_compile /handler.py && python -c 'import runpod, websocket, PIL, torch; print(torch.__version__)' && pip freeze > /grandshop-build-dependencies.txt && git -C /ComfyUI rev-parse HEAD")
-          root = Path("runtime-context")
-          root.mkdir()
-          shutil.copy2("handler.py", root / "handler.py")
-          shutil.copy2("entrypoint.sh", root / "entrypoint.sh")
-          shutil.copytree("workflow", root / "workflow")
-          (root / "Dockerfile").write_text("# syntax=docker/dockerfile:1\n" + runtime)
-          Path("models.json").write_text(json.dumps(models))
-          print("Validated handler, single-image graph, and four original model URLs.")
-          PY
-          sha256sum runtime-context/handler.py
-          cat runtime-context/Dockerfile
-
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v4
+          url=https://github.com/google/go-containerregistry/releases/download/v0.22.1
+          curl --fail --location --silent --show-error --retry 3 "$url/go-containerregistry_Linux_x86_64.tar.gz" -o "$RUNNER_TEMP/crane.tar.gz"
+          mkdir -p "$RUNNER_TEMP/crane-bin"
+          tar -xzf "$RUNNER_TEMP/crane.tar.gz" -C "$RUNNER_TEMP/crane-bin" crane
+          echo "$RUNNER_TEMP/crane-bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/crane-bin/crane" version
 
       - name: Sign in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -86,67 +48,81 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build runtime from the pinned public base
-        id: runtime
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag="${IMAGE_NAME}:stage-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-runtime"
-          docker buildx build --platform linux/amd64 --push --provenance=false --sbom=false --progress=plain --metadata-file runtime-metadata.json --tag "$tag" --label "org.opencontainers.image.source=https://github.com/hamedasssi-ctrl/qwen_image_edit" --label "org.opencontainers.image.revision=$SOURCE_SHA" runtime-context
-          digest="$(python3 -c 'import json; print(json.load(open("runtime-metadata.json"))["containerimage.digest"])')"
-          echo "${IMAGE_NAME}@$digest" > current-base.txt
-          echo "ref=${IMAGE_NAME}@$digest" >> "$GITHUB_OUTPUT"
-          docker buildx prune --all --force
-          df -h /
-
-      - name: Add original model weights one layer at a time
+      - name: Add and validate the four original model files
         id: candidate
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json, os, re, subprocess
-          from pathlib import Path
-          models = json.loads(Path("models.json").read_text())
-          image = os.environ["IMAGE_NAME"]
-          run = os.environ["GITHUB_RUN_ID"]
-          attempt = os.environ["GITHUB_RUN_ATTEMPT"]
-          base = Path("current-base.txt").read_text().strip()
-          context = Path("asset-context")
-          context.mkdir(exist_ok=True)
-          for number, (url, destination) in enumerate(models, start=1):
-              final = number == len(models)
-              tag = f"{image}:candidate-0d9f539-{run}-{attempt}" if final else f"{image}:stage-{run}-{attempt}-model{number}"
-              dockerfile = f"# syntax=docker/dockerfile:1\nFROM {base}\nADD --link --chmod=0644 {url} {destination}\n"
-              (context / "Dockerfile").write_text(dockerfile)
-              metadata = f"model-{number}-metadata.json"
-              print(f"Adding model {number}/{len(models)}: {destination}", flush=True)
-              subprocess.run(["docker", "buildx", "build", "--platform", "linux/amd64", "--push", "--provenance=false", "--sbom=false", "--progress=plain", "--metadata-file", metadata, "--tag", tag, str(context)], check=True)
-              digest = json.loads(Path(metadata).read_text())["containerimage.digest"]
-              assert re.fullmatch(r"sha256:[a-f0-9]{64}", digest)
-              base = f"{image}@{digest}"
-              Path("current-base.txt").write_text(base)
-              subprocess.run(["docker", "buildx", "prune", "--all", "--force"], check=True)
-              subprocess.run(["df", "-h", "/"], check=True)
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f"tag={tag}\nref={base}\n")
-          print(f"Candidate image: {tag}\nImmutable image: {base}", flush=True)
+          python - <<'PY'
+          import hashlib, json, os, pathlib, re, shutil, struct, subprocess
+          def run(*args):
+              return subprocess.check_output(args, text=True).strip()
+          source = pathlib.Path('Dockerfile').read_text()
+          models = re.findall(r'RUN wget -q (\S+) -O (\S+)', source)
+          assert len(models) == 4, 'Expected exactly four original model files'
+          image = os.environ['IMAGE_NAME']
+          base = os.environ['RUNTIME_REF']
+          original = json.loads(run('crane', 'config', base))
+          assert original['architecture'] == 'amd64' and original['os'] == 'linux'
+          assert 'entrypoint.sh' in ' '.join(original['config'].get('Cmd', []))
+          original_layers = json.loads(run('crane', 'manifest', base))['layers']
+          records = []
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'grandshop-model-layer'
+          root.mkdir()
+          for index, (url, dest) in enumerate(models, 1):
+              assert url.startswith('https://huggingface.co/')
+              assert dest.startswith('/ComfyUI/models/') and '..' not in dest
+              assert dest.endswith('.safetensors')
+              assert shutil.disk_usage(root).free > 45 * 1024**3, 'Insufficient free disk space'
+              payload = root / 'payload'
+              target = payload / dest.lstrip('/')
+              target.parent.mkdir(parents=True)
+              print(f'Downloading model {index}/4: {dest}', flush=True)
+              subprocess.run(['curl', '--fail', '--location', '--silent', '--show-error', '--retry', '3', '--connect-timeout', '30', url, '-o', str(target)], check=True)
+              size = target.stat().st_size
+              with target.open('rb') as f:
+                  header_size = struct.unpack('<Q', f.read(8))[0]
+                  assert 0 < header_size < 100_000_000, 'Invalid safetensors header'
+                  header = json.loads(f.read(header_size))
+              tensors = [v for k, v in header.items() if k != '__metadata__']
+              assert tensors and max(t['data_offsets'][1] for t in tensors) == size - 8 - header_size, 'Incomplete model download'
+              digest = hashlib.sha256()
+              with target.open('rb') as f:
+                  for block in iter(lambda: f.read(8 * 1024**2), b''):
+                      digest.update(block)
+              target.chmod(0o644)
+              records.append({'path': dest, 'url': url, 'bytes': size, 'sha256': digest.hexdigest()})
+              print(f'Validated {size} bytes; SHA256 {digest.hexdigest()}', flush=True)
+              layer = root / 'model.tar.gz'
+              with layer.open('wb') as out:
+                  tar = subprocess.Popen(['tar', '--owner=0', '--group=0', '--numeric-owner', '-C', str(payload), '-cf', '-', 'ComfyUI'], stdout=subprocess.PIPE)
+                  gzip = subprocess.run(['gzip', '-1'], stdin=tar.stdout, stdout=out)
+                  tar.stdout.close()
+                  assert gzip.returncode == 0 and tar.wait() == 0, 'Layer packaging failed'
+              tag = f"{image}:stage-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}-model{index}"
+              if index == 4:
+                  tag = f"{image}:candidate-{os.environ['SOURCE_SHA'][:7]}-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
+              print(f'Publishing model {index}/4 without downloading parent layers', flush=True)
+              subprocess.run(['crane', 'append', '--base', base, '--new_layer', str(layer), '--new_tag', tag], check=True)
+              base = f"{image}@{run('crane', 'digest', tag)}"
+              print(f'Saved model {index}/4: {base}', flush=True)
+              shutil.rmtree(payload)
+              layer.unlink()
+          final = json.loads(run('crane', 'config', base))
+          assert final['config'] == original['config'], 'Runtime configuration changed'
+          manifest = json.loads(run('crane', 'manifest', base))
+          assert manifest['layers'][:len(original_layers)] == original_layers
+          assert len(manifest['layers']) == len(original_layers) + 4
+          report = {'tag': tag, 'ref': base, 'source': os.environ['SOURCE_SHA'], 'runtime': os.environ['RUNTIME_REF'], 'models': records, 'gpu_test': 'NOT_RUN', 'runpod_changed': False}
+          pathlib.Path('candidate-build-report.json').write_text(json.dumps(report, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'tag={tag}\nref={base}\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write('### Grand Shop candidate built; GPU quality test still required\n\n')
+              out.write(f'- Image: `{tag}`\n- Immutable image: `{base}`\n')
+              out.write(f"- Source: `{os.environ['SOURCE_SHA']}`\n")
+              out.write('- Four model files validated; runtime configuration preserved.\n')
+              out.write('- Existing RunPod endpoint and Release 1 were not changed. No GPU job submitted.\n\n')
+              out.write('```json\n' + json.dumps(report, indent=2) + '\n```\n')
+          print(f'Candidate image: {tag}\nImmutable image: {base}', flush=True)
           PY
-
-      - name: Record candidate and approval boundary
-        env:
-          CANDIDATE_TAG: ${{ steps.candidate.outputs.tag }}
-          CANDIDATE_REF: ${{ steps.candidate.outputs.ref }}
-        shell: bash
-        run: |
-          {
-            echo "### Candidate built from source; GPU quality test still required"
-            echo "- Image: $CANDIDATE_TAG"
-            echo "- Immutable image: $CANDIDATE_REF"
-            echo "- Source: $SOURCE_SHA"
-            echo "- Public base: $PUBLIC_BASE"
-            echo "- Model files: the four URLs from the reviewed Dockerfile"
-            echo "- Runtime dependencies were rebuilt from the source Dockerfile."
-            echo "- Existing RunPod endpoint and Release 1 were not changed."
-            echo "- No GPU test was submitted."
-          } >> "$GITHUB_STEP_SUMMARY"
